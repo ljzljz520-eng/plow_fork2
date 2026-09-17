@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -46,15 +50,39 @@ var (
 	reqWriteTimeout  = kingpin.Flag("req-timeout", "Timeout for full request writing").PlaceHolder("DURATION").Duration()
 	respReadTimeout  = kingpin.Flag("resp-timeout", "Timeout for full response reading").PlaceHolder("DURATION").Duration()
 	socks5           = kingpin.Flag("socks5", "Socks5 proxy").PlaceHolder("ip:port").String()
-	httpProxy        = kingpin.Flag("http-proxy","Set HTTP proxy").PlaceHolder("username:password@ip:port").String()
+	httpProxy        = kingpin.Flag("http-proxy", "Set HTTP proxy").PlaceHolder("username:password@ip:port").String()
 
 	autoOpenBrowser = kingpin.Flag("auto-open-browser", "Specify whether auto open browser to show web charts").Bool()
 	clean           = kingpin.Flag("clean", "Clean the histogram bar once its finished. Default is true").Default("true").NegatableBool()
 	outputErrors    = kingpin.Flag("output-errors", "Output errors to file").String()
 	summary         = kingpin.Flag("summary", "Only print the summary without realtime reports").Default("false").Bool()
 	pprofAddr       = kingpin.Flag("pprof", "Enable pprof at special address").Hidden().String()
-	url             = kingpin.Arg("url", "Request url").Required().String()
-	unixSocket      = kingpin.Flag("unix-socket", "Unix domain socket path to use for connection").String()
+
+	// Distributed coordination (--dist controller|agent).
+	distMode = kingpin.Flag("dist", "Distributed mode: standalone, controller or agent").
+			Default("standalone").Enum("standalone", "controller", "agent")
+	controllerListen = kingpin.Flag("controller-listen", "controller mode: listen address for agent coordination").
+				Default(":19000").String()
+	controllerURL = kingpin.Flag("controller", "agent mode: controller base url, e.g. http://10.0.0.1:19000").String()
+	agentID       = kingpin.Flag("agent-id", "agent mode: stable node id (defaults to hostname-random)").String()
+	agentHost     = kingpin.Flag("agent-host", "agent mode: override the reported hostname (e.g. multiple agents per machine or shared container hostname)").String()
+	nodeWeight    = kingpin.Flag("node-weight", "agent mode: capacity weight used to split global RPS/concurrency").
+			Default("1").Float64()
+	joinWait = kingpin.Flag("join-wait", "controller: grace period after the first agent registers before arming").
+			Default("3s").Duration()
+	minAgents = kingpin.Flag("min-agents", "controller: minimum synchronized agents required to arm").
+			Default("1").Int()
+	hbInterval = kingpin.Flag("heartbeat", "controller: expected agent heartbeat interval").
+			Default("1s").Duration()
+	hbTimeout = kingpin.Flag("heartbeat-timeout", "controller: mark an agent failed after missing heartbeats").
+			Default("5s").Duration()
+	maxClockError = kingpin.Flag("max-clock-error", "controller: max tolerated agent clock dispersion for the synchronized start").
+			Default("2s").Duration()
+	startLead = kingpin.Flag("start-delay", "controller: minimum lead time before the synchronized start").
+			Default("2s").Duration()
+
+	url        = kingpin.Arg("url", "Request url (standalone/controller mode)").String()
+	unixSocket = kingpin.Flag("unix-socket", "Unix domain socket path to use for connection").String()
 )
 
 // dynamically set by GoReleaser
@@ -189,6 +217,17 @@ func main() {
 		Help = `A high-performance HTTP benchmarking tool with real-time web UI and terminal displaying`
 	kingpin.Parse()
 
+	// Agent mode needs no target url/body configuration; it is fully driven
+	// by the controller.
+	if *distMode == "agent" {
+		runAgent()
+		return
+	}
+	if *url == "" {
+		errAndExit("the request url is required in standalone/controller mode")
+		return
+	}
+
 	if *requests >= 0 && *requests < int64(*concurrency) {
 		errAndExit("requests must greater than or equal concurrency")
 		return
@@ -214,6 +253,10 @@ func main() {
 				return
 			}
 			if *stream {
+				if *distMode == "controller" {
+					errAndExit("--stream body file cannot be distributed; inline the body or read it into memory on the controller")
+					return
+				}
 				bodyFile = fileName
 			} else {
 				bodyBytes, err = os.ReadFile(fileName)
@@ -262,6 +305,11 @@ func main() {
 		contentType: *contentType,
 		host:        *host,
 		unixSocket:  *unixSocket,
+	}
+
+	if *distMode == "controller" {
+		runController(&clientOpt, bodyBytes)
+		return
 	}
 
 	requester, err := NewRequester(*concurrency, *requests, *duration, reqRate.Limit(), errWriter, &clientOpt, *rampUp)
@@ -317,4 +365,121 @@ func main() {
 	// terminal printer
 	printer := NewPrinter(*requests, *duration, !*clean, *summary)
 	printer.PrintLoop(report.Snapshot, *interval, *seconds, *jsonFormat, report.Done())
+}
+
+// runAgent starts a load-generating node driven by a remote controller.
+func runAgent() {
+	if *controllerURL == "" {
+		errAndExit("--controller <url> is required in agent mode")
+		return
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	a, err := newAgent(*controllerURL, *agentID, *agentHost, *nodeWeight)
+	if err != nil {
+		errAndExit(err.Error())
+		return
+	}
+	fmt.Fprintf(os.Stderr, "@ plow agent %s (%s) joining controller %s\n", a.id, a.host, *controllerURL)
+	if err := a.Run(ctx); err != nil {
+		errAndExit(err.Error())
+	}
+}
+
+// buildTestConfig turns the parsed CLI options into the canonical, hashable
+// configuration broadcast to every agent.
+func buildTestConfig(opt *ClientOpt, bodyBytes []byte) *TestConfig {
+	cfg := &TestConfig{
+		ProtocolVersion: clusterProtocolVersion,
+		URL:             opt.url,
+		Method:          opt.method,
+		Headers:         opt.headers,
+		ContentType:     opt.contentType,
+		Host:            opt.host,
+		Insecure:        opt.insecure,
+		DoTimeoutNS:     opt.doTimeout.Nanoseconds(),
+		ReadTimeoutNS:   opt.readTimeout.Nanoseconds(),
+		WriteTimeoutNS:  opt.writeTimeout.Nanoseconds(),
+		DialTimeoutNS:   opt.dialTimeout.Nanoseconds(),
+		Socks5Proxy:     opt.socks5Proxy,
+		HTTPProxy:       opt.httpProxy,
+		UnixSocket:      opt.unixSocket,
+		Concurrency:     *concurrency,
+		Requests:        *requests,
+		DurationNS:      duration.Nanoseconds(),
+		RampUp:          *rampUp,
+	}
+	if l := reqRate.Limit(); l != nil {
+		cfg.Rate = float64(*l)
+	}
+	if len(bodyBytes) > 0 {
+		cfg.BodyB64 = base64.StdEncoding.EncodeToString(bodyBytes)
+	}
+	return cfg
+}
+
+// runController starts the coordinator and feeds its aggregated reports into
+// the same printer and web charts as standalone mode.
+func runController(opt *ClientOpt, bodyBytes []byte) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg := buildTestConfig(opt, bodyBytes)
+	co := controllerOptions{
+		heartbeatInterval: *hbInterval,
+		heartbeatTimeout:  *hbTimeout,
+		joinWait:          *joinWait,
+		minAgents:         *minAgents,
+		minStartDelay:     *startLead,
+		maxClockError:     *maxClockError,
+		finishGrace:       3 * *hbInterval,
+	}
+	ctrl, err := newController(cfg, co)
+	if err != nil {
+		errAndExit(err.Error())
+		return
+	}
+	if err := ctrl.Start(ctx, *controllerListen); err != nil {
+		errAndExit(err.Error())
+		return
+	}
+	agg := ctrl.Aggregator()
+
+	desc := fmt.Sprintf("Distributed benchmarking %s", *url)
+	if *requests > 0 {
+		desc += fmt.Sprintf(" with %d request(s)", *requests)
+	}
+	if *duration > 0 {
+		desc += fmt.Sprintf(" for %s", duration.String())
+	}
+	desc += fmt.Sprintf(" using %d global connection(s).", *concurrency)
+	fmt.Fprintln(os.Stderr, desc)
+	fmt.Fprintf(os.Stderr, "@ waiting for agents to register (--join-wait %s, --min-agents %d)\n", *joinWait, *minAgents)
+
+	var ln net.Listener
+	if *chartsListenAddr != "" {
+		ln, err = net.Listen("tcp", *chartsListenAddr)
+		if err != nil {
+			errAndExit(err.Error())
+			return
+		}
+		fmt.Fprintf(os.Stderr, "@ Real-time charts is listening on http://%s\n", ln.Addr().String())
+	}
+	fmt.Fprintln(os.Stderr, "")
+
+	if ln != nil {
+		charts, err := NewCharts(ln, agg.Charts, desc)
+		if err != nil {
+			errAndExit(err.Error())
+			return
+		}
+		go charts.Serve(*autoOpenBrowser)
+	}
+
+	printer := NewPrinter(*requests, *duration, !*clean, *summary)
+	printer.PrintLoop(agg.Snapshot, *interval, *seconds, *jsonFormat, agg.Done())
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ctrl.Shutdown(shutdownCtx)
 }

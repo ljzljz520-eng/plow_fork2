@@ -110,7 +110,50 @@ type Requester struct {
 	readBytes  int64
 	writeBytes int64
 
+	// Distributed scheduling. When startAt/stopAt are set, Run waits for the
+	// exact absolute instant instead of starting immediately, allowing every
+	// cluster node to fire at the same controller-scheduled moment.
+	startAt time.Time
+	stopAt  time.Time
+
+	// Remaining request quota, mutated atomically when the controller
+	// rebalances budgets across live nodes.
+	quota        atomic.Int64
+	quotaEnabled atomic.Bool
+
+	// Dynamic per-node RPS; swapped at runtime by set_rate commands.
+	rateLimiter atomic.Pointer[rate.Limiter]
+
+	// Created in the constructor so external Cancel calls are safe at any
+	// time, including the window before Run starts, where a cluster stop or
+	// abort may race the prepare command.
+	ctx    context.Context
 	cancel func()
+}
+
+// SetSchedule pins the run to absolute local-clock instants. All cluster
+// nodes receive the same controller-domain times converted with their clock
+// offset, so traffic starts/stops simultaneously regardless of clock skew.
+func (r *Requester) SetSchedule(startAt, stopAt time.Time) {
+	r.startAt = startAt
+	r.stopAt = stopAt
+}
+
+// SetRate dynamically updates the node RPS limit (nil means unlimited).
+func (r *Requester) SetRate(l *rate.Limiter) {
+	r.rateLimiter.Store(l)
+}
+
+// SetQuota replaces the remaining request budget of this node. A negative
+// value means unlimited. Used when the controller redistributes the share of
+// a node that left or died.
+func (r *Requester) SetQuota(n int64) {
+	if n < 0 {
+		r.quotaEnabled.Store(false)
+		return
+	}
+	r.quota.Store(n)
+	r.quotaEnabled.Store(true)
 }
 
 type ClientOpt struct {
@@ -152,6 +195,11 @@ func NewRequester(concurrency int, requests int64, duration time.Duration, reqRa
 		clientOpt:   clientOpt,
 		recordChan:  make(chan *ReportRecord, maxResult),
 	}
+	if requests > 0 {
+		r.quota.Store(requests)
+		r.quotaEnabled.Store(true)
+	}
+	r.ctx, r.cancel = context.WithCancel(context.Background())
 	client, header, err := buildRequestClient(clientOpt, &r.readBytes, &r.writeBytes)
 	if err != nil {
 		return nil, err
@@ -267,6 +315,18 @@ func (r *Requester) closeRecord() {
 	})
 }
 
+// emitRecord delivers a sample, bailing out once the run is canceled. The
+// channel is closed only after every worker has returned (Run closes it past
+// wg.Wait), so send and close can never race; the ctx guard additionally
+// prevents a worker from blocking on a full buffer after stop.
+func (r *Requester) emitRecord(ctx context.Context, rr *ReportRecord) {
+	select {
+	case r.recordChan <- rr:
+	case <-ctx.Done():
+		recordPool.Put(rr)
+	}
+}
+
 func (r *Requester) DoRequest(req *fasthttp.Request, resp *fasthttp.Response, rr *ReportRecord) {
 	startTime := time.Unix(0, atomic.LoadInt64(&startTimeUnixNano))
 	t1 := time.Since(startTime)
@@ -306,14 +366,14 @@ func (r *Requester) Run() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	r.cancel = cancelFunc
+	ctx, cancelFunc := r.ctx, r.cancel
 	signalDone := make(chan struct{})
 	go func() {
 		defer close(signalDone)
 		select {
 		case <-sigs:
-			r.closeRecord()
+			// Signal workers to stop; recordChan is closed only after every
+			// sender has exited, so a signal can never race a pending send.
 			cancelFunc()
 		case <-ctx.Done():
 		}
@@ -323,20 +383,44 @@ func (r *Requester) Run() {
 		cancelFunc()
 		<-signalDone
 	}()
-	atomic.StoreInt64(&startTimeUnixNano, time.Now().UnixNano())
-	if r.duration > 0 {
-		time.AfterFunc(r.duration, func() {
-			r.closeRecord()
-			cancelFunc()
-		})
+	// Wait for the synchronized absolute start instant when running under
+	// the cluster controller; otherwise start immediately.
+	start := time.Now()
+	if !r.startAt.IsZero() {
+		wait := time.Until(r.startAt)
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+			}
+		}
+		// Anchor stats to the scheduled instant on every node, even if the
+		// goroutine woke up a little late.
+		start = r.startAt
+	}
+	atomic.StoreInt64(&startTimeUnixNano, start.UnixNano())
+
+	// Stop at the absolute stop instant (cluster) or after duration (local).
+	stopAt := r.stopAt
+	if stopAt.IsZero() && r.duration > 0 {
+		stopAt = start.Add(r.duration)
+	}
+	if !stopAt.IsZero() && stopAt.After(start) {
+		d := time.Until(stopAt)
+		if d < 0 {
+			d = 0
+		}
+		time.AfterFunc(d, cancelFunc)
 	}
 
-	var limiter *rate.Limiter
+	// The shared limiter is always read through an atomic pointer so a
+	// cluster controller can swap the per-node RPS at runtime (set_rate).
 	if r.reqRate != nil {
-		limiter = rate.NewLimiter(*r.reqRate, 1)
+		r.rateLimiter.Store(rate.NewLimiter(*r.reqRate, 1))
 	}
 
-	semaphore := r.requests
 	if r.rampUp <= 0 {
 		r.rampUp = r.concurrency
 	}
@@ -348,8 +432,9 @@ func (r *Requester) Run() {
 				break
 			}
 			concurrencyCount++
+			workerID := concurrencyCount
 			r.wg.Add(1)
-			go func() {
+			go func(concurrencyCount int) {
 				defer func() {
 					r.wg.Done()
 					v := recover()
@@ -372,15 +457,18 @@ func (r *Requester) Run() {
 					default:
 					}
 
-					if limiter != nil {
+					if limiter := r.rateLimiter.Load(); limiter != nil {
 						err := limiter.Wait(ctx)
 						if err != nil {
 							continue
 						}
 					}
 
-					if r.requests > 0 && atomic.AddInt64(&semaphore, -1) < 0 {
-						cancelFunc()
+					if r.quotaEnabled.Load() && r.quota.Add(-1) < 0 {
+						// This node's budget is spent. Do not cancel the shared
+						// context: peers may be finishing a quota-charged,
+						// in-flight request whose record must still be counted.
+						// They independently fail their next token check.
 						return
 					}
 
@@ -393,7 +481,7 @@ func (r *Requester) Run() {
 							rr.readBytes = atomic.LoadInt64(&r.readBytes)
 							rr.writeBytes = atomic.LoadInt64(&r.writeBytes)
 							rr.concurrencyCount = concurrencyCount
-							r.recordChan <- rr
+							r.emitRecord(ctx, rr)
 							continue
 						}
 						req.SetBodyStream(file, -1)
@@ -406,11 +494,14 @@ func (r *Requester) Run() {
 					rr.readBytes = atomic.LoadInt64(&r.readBytes)
 					rr.writeBytes = atomic.LoadInt64(&r.writeBytes)
 					rr.concurrencyCount = concurrencyCount
-					r.recordChan <- rr
+					r.emitRecord(ctx, rr)
 				}
-			}()
+			}(workerID)
 		}
-		if r.rampUp != r.concurrency {
+		// Wait between ramp-up batches, but never after the last one so a
+		// node whose assigned concurrency is below the ramp-up size exits
+		// promptly once its quota is exhausted.
+		if i < loopCount-1 {
 			time.Sleep(time.Second)
 		}
 	}
